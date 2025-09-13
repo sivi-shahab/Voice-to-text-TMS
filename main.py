@@ -1,51 +1,65 @@
 import os
 import tempfile
 import logging
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
 
-# --------------------------
-# Konfigurasi dasar (bisa di-override via ENV)
-# --------------------------
-MODEL_SIZE = os.getenv("WHISPER_MODEL", "large-v3")          # ex: tiny, base, small, medium, large-v3
-DEVICE     = os.getenv("WHISPER_DEVICE", "cuda")              # "cuda" untuk GPU, "cpu" untuk CPU
-COMPUTE    = os.getenv("WHISPER_COMPUTE_TYPE", "float16")     # "float16" (GPU), "int8", "int8_float16", dll
-BEAM_SIZE  = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
-
-# Batasi tipe file audio umum
-ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}
+# =========================
+# Konfigurasi
+# =========================
+MODEL_SIZE = os.getenv("WHISPER_MODEL", "large-v3")
+DEVICE     = os.getenv("WHISPER_DEVICE", "cuda")         # "cuda"|"cpu"
+COMPUTE    = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 MAX_FILE_MB  = int(os.getenv("MAX_FILE_MB", "100"))
+# mode pilihan bahasa: "force_id", "force_en", "auto_id_en"
+LANGUAGE_MODE = os.getenv("LANGUAGE_MODE", "auto_id_en")
+
+# kecepatan/akurasi (default cepat)
+DEFAULT_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))   # 1=greedy
+DEFAULT_CHUNK_LEN = int(os.getenv("WHISPER_CHUNK_LENGTH", "30"))
+DEFAULT_BATCH     = int(os.getenv("WHISPER_BATCH_SIZE", "16"))
+
+ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}
+ALLOWED_LANGS = {"id", "en"}  # HANYA dua ini
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("whisper-api")
 
 app = FastAPI(
-    title="Whisper Transcribe API",
-    version="1.0.0",
-    description="API sederhana untuk uji transkripsi audio menggunakan faster-whisper."
+    title="Whisper (ID/EN only) - Fast API",
+    version="1.2.0",
+    description="Transkripsi cepat hanya Bahasa Indonesia & Inggris (faster-whisper)."
 )
 
-# --------------------------
-# Inisialisasi model saat startup
-# --------------------------
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+# =========================
+# Model
+# =========================
 @app.on_event("startup")
 def _load_model():
-    global asr_model
-    try:
-        logger.info(f"Loading Whisper model: size={MODEL_SIZE}, device={DEVICE}, compute_type={COMPUTE}")
-        asr_model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE)
-        logger.info("Model loaded.")
-    except Exception as e:
-        logger.exception("Gagal load model whisper")
-        raise
+    global asr
+    logger.info(f"Loading model: size={MODEL_SIZE}, device={DEVICE}, compute={COMPUTE}")
+    asr = WhisperModel(
+        MODEL_SIZE,
+        device=DEVICE,
+        compute_type=COMPUTE
+    )
+    logger.info("Model loaded.")
 
-# --------------------------
-# Skema respons
-# --------------------------
+# =========================
+# Schemas
+# =========================
 class Segment(BaseModel):
     start: float
     end: float
@@ -53,91 +67,132 @@ class Segment(BaseModel):
 
 class TranscribeResponse(BaseModel):
     success: bool
-    detected_language: str
-    language_probability: float
-    duration: Optional[float] = None
+    final_language: str
     text: str
     segments: List[Segment]
+    mode: str
 
-# --------------------------
-# Healthcheck
-# --------------------------
+# =========================
+# Util
+# =========================
+def _quick_text(path: str, lang: str) -> Tuple[str, int]:
+    """
+    Transkripsi cepat (tanpa timestamp) utk scoring pemilihan ID vs EN.
+    Mengembalikan (text, length).
+    """
+    segs, _ = asr.transcribe(
+        path,
+        language=lang,
+        task="transcribe",
+        beam_size=1,                  # greedy
+        vad_filter=True,
+        without_timestamps=True,
+        chunk_length=15,              # lebih pendek buat cepat
+        batch_size=DEFAULT_BATCH,
+        temperature=0.0,
+        condition_on_previous_text=False
+    )
+    txt = "".join(s.text for s in segs).strip()
+    return txt, len(txt)
+
+def _full_transcribe(path: str, lang: str, beam_size: int) -> Tuple[List[Segment], str]:
+    segs, _ = asr.transcribe(
+        path,
+        language=lang,
+        task="transcribe",
+        beam_size=beam_size,
+        vad_filter=True,
+        chunk_length=DEFAULT_CHUNK_LEN,
+        batch_size=DEFAULT_BATCH,
+        temperature=0.0,
+        condition_on_previous_text=False
+    )
+    out = [Segment(start=s.start, end=s.end, text=s.text) for s in segs]
+    return out, "".join(s.text for s in out).strip()
+
+# =========================
+# Health
+# =========================
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_size": MODEL_SIZE, "device": DEVICE, "compute_type": COMPUTE}
+    return {
+        "status": "ok",
+        "model": MODEL_SIZE,
+        "device": DEVICE,
+        "compute_type": COMPUTE,
+        "language_mode": LANGUAGE_MODE,
+        "allowed_langs": sorted(ALLOWED_LANGS),
+        "beam_size": DEFAULT_BEAM_SIZE,
+        "chunk_length": DEFAULT_CHUNK_LEN,
+        "batch_size": DEFAULT_BATCH
+    }
 
-# --------------------------
-# Endpoint transkripsi
-# --------------------------
+# =========================
+# Transcribe (ID/EN only)
+# =========================
 @app.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe_audio(
-    audio: UploadFile = File(..., description="File audio (mp3/wav/m4a/flac/ogg/webm)"),
-    beam_size: int = Query(BEAM_SIZE, ge=1, le=10, description="Beam size decoding"),
-    task: str = Query("transcribe", pattern="^(transcribe|translate)$", description="transcribe atau translate ke English"),
-    language: Optional[str] = Query(None, description="Kode bahasa (opsional). Biarkan kosong untuk auto-detect.")
+    audio: UploadFile = File(..., description="Audio mp3/wav/m4a/flac/ogg/webm"),
+    # override per-request (opsional)
+    language_mode: str = Query(
+        None,
+        pattern="^(force_id|force_en|auto_id_en)$",
+        description="force_id | force_en | auto_id_en (default dari ENV)"
+    ),
+    beam_size: int = Query(None, ge=1, le=10, description="Beam size (1=greedy tercepat)")
 ):
-    # Validasi ekstensi & ukuran
-    name_lower = audio.filename.lower()
-    _, ext = os.path.splitext(name_lower)
+    mode = language_mode or LANGUAGE_MODE
+    beam = beam_size or DEFAULT_BEAM_SIZE
+
+    # Validasi file
+    name_low = audio.filename.lower()
+    _, ext = os.path.splitext(name_low)
     if ext not in ALLOWED_EXTS:
-        raise HTTPException(status_code=400, detail=f"Ekstensi {ext} tidak didukung. Gunakan salah satu: {sorted(ALLOWED_EXTS)}")
+        raise HTTPException(status_code=400, detail=f"Ekstensi {ext} tidak didukung. {sorted(ALLOWED_EXTS)}")
 
-    # Cek ukuran (jika header Content-Length ada)
-    size_hdr = audio.headers.get("content-length") or audio.headers.get("Content-Length")
-    if size_hdr:
+    hdr = audio.headers.get("content-length") or audio.headers.get("Content-Length")
+    if hdr:
         try:
-            size_mb = int(size_hdr) / (1024 * 1024)
-            if size_mb > MAX_FILE_MB:
-                raise HTTPException(status_code=413, detail=f"File terlalu besar. Maks {MAX_FILE_MB} MB")
+            if int(hdr) / (1024*1024) > MAX_FILE_MB:
+                raise HTTPException(status_code=413, detail=f"File > {MAX_FILE_MB} MB")
         except ValueError:
-            pass  # jika tak bisa parse, lanjut
+            pass
 
-    # Simpan ke file sementara
+    # Simpan sementara
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            content = await audio.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+            tmp.write(await audio.read())
+            path = tmp.name
     except Exception:
         raise HTTPException(status_code=500, detail="Gagal menyimpan file sementara")
 
     try:
-        # Transcribe
-        # Catatan: parameter default sudah 'standard'; kita expose minimal opsional
-        segments, info = asr_model.transcribe(
-            tmp_path,
-            beam_size=beam_size,
-            task=task,
-            language=language  # None => auto-detect
-            # Anda bisa menambahkan parameter lain jika perlu (temperature, vad_filter, dll.)
-        )
+        # Tentukan bahasa final:
+        if mode == "force_id":
+            final_lang = "id"
+        elif mode == "force_en":
+            final_lang = "en"
+        else:
+            # auto_id_en: bandingkan hasil cepat antara 'id' vs 'en'
+            _, len_id = _quick_text(path, "id")
+            _, len_en = _quick_text(path, "en")
+            final_lang = "id" if len_id >= len_en else "en"
 
-        # Kumpulkan hasil
-        seg_list = []
-        full_text = []
-        for seg in segments:
-            seg_list.append(Segment(start=seg.start, end=seg.end, text=seg.text))
-            full_text.append(seg.text)
-
-        text_joined = "".join(full_text).strip()
-
-        resp = TranscribeResponse(
+        segments, text = _full_transcribe(path, final_lang, beam)
+        return JSONResponse(content=TranscribeResponse(
             success=True,
-            detected_language=info.language,
-            language_probability=float(info.language_probability or 0.0),
-            duration=getattr(info, "duration", None),
-            text=text_joined,
-            segments=seg_list
-        )
-        return JSONResponse(content=resp.dict())
+            final_language=final_lang,
+            text=text,
+            segments=segments,
+            mode=mode
+        ).dict())
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Gagal melakukan transcribe")
+        logging.exception("Transcribe error")
         raise HTTPException(status_code=500, detail=f"Transcribe error: {str(e)}")
     finally:
-        # Bersihkan file sementara
         try:
-            os.remove(tmp_path)
+            os.remove(path)
         except Exception:
             pass
