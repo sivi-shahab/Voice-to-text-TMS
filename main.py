@@ -79,6 +79,14 @@ def _load_model():
     except Exception:
         logger.exception("Gagal load model Whisper")
         raise
+    
+# =========================
+# Helper functions
+# =========================
+def _fmt_mmss(sec: float) -> str:
+    s = int(round(sec))
+    m, s = divmod(s, 60)
+    return f"{m:02d}:{s:02d}"
 
 
 # =========================
@@ -113,6 +121,14 @@ class TranscribeResponse(BaseModel):
     compute_type: str
     cpu_threads: int
     num_workers: int
+    
+class SegOnlyItem(BaseModel):
+    range_mmss: str
+    text: str
+
+class SegOnlyResponse(BaseModel):
+    language: str  # selalu "id"
+    segments: List[SegOnlyItem]
 
 
 # =========================
@@ -264,3 +280,68 @@ async def transcribe_audio(
             os.remove(tmp_path)
         except Exception:
             pass
+        
+@app.post("/transcribe_segments", response_model=SegOnlyResponse)
+async def transcribe_segments(
+    audio: UploadFile = File(..., description="Audio mp3/wav/m4a/flac/ogg/webm"),
+    mode: str = Query(
+        "balanced",
+        pattern="^(balanced|aggressive)$",
+        description="balanced (cepat) | aggressive (dorong GPU)"
+    ),
+    beam_size: int | None = Query(None, ge=1, le=10, description="Default balanced=1, aggressive=3"),
+    chunk_length: int | None = Query(None, ge=0, le=30, description="Maks 30s (batas Whisper)"),
+):
+    # --- validasi & simpan sementara (sama seperti /transcribe) ---
+    name_lower = (audio.filename or "").lower()
+    _, ext = os.path.splitext(name_lower)
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(status_code=400, detail=f"Ekstensi {ext} tidak didukung. {sorted(ALLOWED_EXTS)}")
+
+    hdr = audio.headers.get("content-length") or audio.headers.get("Content-Length")
+    if hdr:
+        try:
+            if int(hdr) / (1024 * 1024) > MAX_FILE_MB:
+                raise HTTPException(status_code=413, detail=f"File > {MAX_FILE_MB} MB")
+        except ValueError:
+            pass
+
+    # preset performa
+    if mode == "balanced":
+        beam = beam_size if beam_size else 1
+        chunk = chunk_length if chunk_length is not None else 30
+    else:
+        beam = beam_size if beam_size else 3
+        chunk = chunk_length if chunk_length is not None else 30
+
+    # simpan file
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(await audio.read())
+            tmp_path = tmp.name
+    except Exception:
+        raise HTTPException(status_code=500, detail="Gagal menyimpan file sementara")
+
+    # transcribe penuh (pakai helper yang sudah ada)
+    try:
+        segments, _text_full, _audio_sec, _ms = _full_transcribe_with_timestamps(
+            tmp_path, beam_size=beam, chunk_length=chunk, temperature=DEFAULT_TEMPERATURE
+        )
+
+        # konversi ke list ringkas: range_mmss + text
+        items = []
+        for s in segments:
+            sm = _fmt_mmss(s.start)
+            em = _fmt_mmss(s.end)
+            items.append(SegOnlyItem(range_mmss=f"{sm}–{em}", text=s.text))
+
+        return SegOnlyResponse(language="id", segments=items)
+    except Exception as e:
+        logging.exception("Transcribe error")
+        raise HTTPException(status_code=500, detail=f"Transcribe error: {str(e)}")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
